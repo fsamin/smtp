@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -119,7 +120,7 @@ func (srv *Server) newConn(rwc net.Conn) (c *conn, err error) {
 	return c, nil
 }
 
-func (srv *Server) ListenAndServe() error {
+func (srv *Server) ListenAndServe(ctx context.Context) error {
 	if srv.Name == "" {
 		srv.Name = "localhost"
 	}
@@ -131,10 +132,10 @@ func (srv *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	return srv.Serve(ln)
+	return srv.Serve(ctx, ln)
 }
 
-func (srv *Server) ListenAndServeTLS(certFile string, keyFile string) error {
+func (srv *Server) ListenAndServeTLS(ctx context.Context, certFile string, keyFile string) error {
 	config := &tls.Config{}
 	if srv.TLSConfig != nil {
 		*config = *srv.TLSConfig
@@ -147,37 +148,45 @@ func (srv *Server) ListenAndServeTLS(certFile string, keyFile string) error {
 	}
 	srv.TLSConfig = config
 
-	return srv.ListenAndServe()
+	return srv.ListenAndServe(ctx)
 }
 
-func (srv *Server) Serve(l net.Listener) error {
+func (srv *Server) Serve(ctx context.Context, l net.Listener) error {
 	defer l.Close()
 	var tempDelay time.Duration
+loop:
 	for {
-		rw, e := l.Accept()
-		if e != nil {
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
+		select {
+		case <-ctx.Done():
+			l.Close()
+			break loop
+		default:
+			rw, e := l.Accept()
+			if e != nil {
+				if ne, ok := e.(net.Error); ok && ne.Temporary() {
+					if tempDelay == 0 {
+						tempDelay = 5 * time.Millisecond
+					} else {
+						tempDelay *= 2
+					}
+					if max := 1 * time.Second; tempDelay > max {
+						tempDelay = max
+					}
+					srv.logf("smtp: Accept error: %v; retrying in %v", e, tempDelay)
+					time.Sleep(tempDelay)
+					continue
 				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
-				}
-				srv.logf("smtp: Accept error: %v; retrying in %v", e, tempDelay)
-				time.Sleep(tempDelay)
+				return e
+			}
+			tempDelay = 0
+			c, err := srv.newConn(rw)
+			if err != nil {
 				continue
 			}
-			return e
+			go c.serve()
 		}
-		tempDelay = 0
-		c, err := srv.newConn(rw)
-		if err != nil {
-			continue
-		}
-		go c.serve()
 	}
+	return ctx.Err()
 }
 
 func (c *conn) serve() {
@@ -578,7 +587,15 @@ func ListenAndServe(addr string, handler Handler) error {
 		handler = DefaultServeMux
 	}
 	server := &Server{Addr: addr, Handler: handler}
-	return server.ListenAndServe()
+	return server.ListenAndServe(context.Background())
+}
+
+func ListenAndServeWithContext(ctx context.Context, addr string, handler Handler) error {
+	if handler == nil {
+		handler = DefaultServeMux
+	}
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServe(ctx)
 }
 
 func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
@@ -586,5 +603,13 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 		handler = DefaultServeMux
 	}
 	server := &Server{Addr: addr, Handler: handler}
-	return server.ListenAndServeTLS(certFile, keyFile)
+	return server.ListenAndServeTLS(context.Background(), certFile, keyFile)
+}
+
+func ListenAndServeTLSWithContext(ctx context.Context, addr, certFile, keyFile string, handler Handler) error {
+	if handler == nil {
+		handler = DefaultServeMux
+	}
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServeTLS(ctx, certFile, keyFile)
 }
